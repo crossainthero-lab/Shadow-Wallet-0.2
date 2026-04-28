@@ -204,11 +204,6 @@ function getAccountById(accountId) {
   return state.wallet.accounts.find((account) => account.id === accountId) || null;
 }
 
-function getAccountByAddress(address) {
-  const normalized = address.trim().toLowerCase();
-  return state.wallet.accounts.find((account) => account.address.toLowerCase() === normalized) || null;
-}
-
 function getAddressBookEntries() {
   const current = getCurrentAccount();
   return state.wallet.accounts.filter((account) => account.id !== current.id);
@@ -307,27 +302,6 @@ function relativeSyncLabel(timestamp) {
 
 function sanitizeDecimal(value) {
   return value.replace(/[^\d.]/g, '').replace(/(\..*)\./g, '$1');
-}
-
-function formatAmountInput(value) {
-  const sanitized = sanitizeDecimal(String(value).replaceAll(',', ''));
-  if (!sanitized) {
-    return '';
-  }
-
-  const hasTrailingDot = sanitized.endsWith('.');
-  const [integerPartRaw, decimalPart] = sanitized.split('.');
-  const integerPart = integerPartRaw ? Number(integerPartRaw).toLocaleString('en-US') : '0';
-
-  if (hasTrailingDot) {
-    return `${integerPart}.`;
-  }
-
-  return decimalPart != null ? `${integerPart}.${decimalPart}` : integerPart;
-}
-
-function parseAmountInput(value) {
-  return Number(String(value).replaceAll(',', ''));
 }
 
 function getActionDelay() {
@@ -437,7 +411,7 @@ function getAssetUsdPrice(assetId) {
 }
 
 function getPortfolioRows() {
-  return getCurrentAccount().holdings
+  const tokenRows = getCurrentAccount().holdings
     .map((holding) => {
       const token = TOKENS_BY_ID[holding.tokenId];
       const price = state.prices[holding.tokenId];
@@ -449,7 +423,31 @@ function getPortfolioRows() {
         change24h: price?.change24h ?? null
       };
     })
-    .sort((a, b) => b.usdValue - a.usdValue);
+  const fiatRows = [];
+  const usdBalance = getFiatBalance('usd');
+  const audBalance = getFiatBalance('aud');
+
+  if (usdBalance > 0) {
+    fiatRows.push({
+      holding: { amount: usdBalance },
+      token: { id: 'fiat-usd', symbol: 'USD', name: 'US Dollar', logoUrl: '' },
+      usdValue: usdBalance,
+      change24h: null,
+      isFiat: true,
+    });
+  }
+
+  if (audBalance > 0) {
+    fiatRows.push({
+      holding: { amount: audBalance },
+      token: { id: 'fiat-aud', symbol: 'AUD', name: 'Australian Dollar', logoUrl: '' },
+      usdValue: audBalance / getAudPerUsd(),
+      change24h: null,
+      isFiat: true,
+    });
+  }
+
+  return [...tokenRows, ...fiatRows].sort((a, b) => b.usdValue - a.usdValue);
 }
 
 function getPortfolioSummary() {
@@ -467,8 +465,9 @@ function getPortfolioSummary() {
   };
 }
 
-function pushActivityToAccount(account, type, tokenId, amount, extra = {}) {
+function pushActivity(type, tokenId, amount, extra = {}) {
   const price = state.prices[tokenId]?.usd || 0;
+  const account = getCurrentAccount();
   account.activity.unshift({
     id: `${Date.now()}-${randomString(6)}`,
     type,
@@ -479,10 +478,6 @@ function pushActivityToAccount(account, type, tokenId, amount, extra = {}) {
     ...extra
   });
   account.activity = account.activity.slice(0, 20);
-}
-
-function pushActivity(type, tokenId, amount, extra = {}) {
-  pushActivityToAccount(getCurrentAccount(), type, tokenId, amount, extra);
 }
 
 function render() {
@@ -555,25 +550,9 @@ function renderActivity() {
   }
 
   dom.activityList.innerHTML = activity.map((item) => {
-    const token = TOKENS_BY_ID[item.tokenId] || SWAP_TARGETS_BY_ID[item.tokenId];
-    const label = item.type === 'buy'
-      ? 'Bought'
-      : item.type === 'swap'
-        ? 'Swapped'
-        : item.type === 'sell'
-          ? 'Sold'
-          : item.type === 'receive'
-            ? 'Received'
-            : 'Sent';
-    const meta = item.type === 'send' && item.to
-      ? `${formatAmount(item.amount)} ${token.symbol} to ${item.toName || `${item.to.slice(0, 6)}...${item.to.slice(-4)}`}`
-      : item.type === 'receive' && item.from
-        ? `${formatAmount(item.amount)} ${token.symbol} from ${item.fromName || `${item.from.slice(0, 6)}...${item.from.slice(-4)}`}`
-        : item.type === 'sell' && item.settlementAssetId
-          ? `${formatAmount(item.amount)} ${token.symbol} for ${formatAmount(item.settlementAmount || 0)} ${SWAP_TARGETS_BY_ID[item.settlementAssetId]?.symbol || ''}`.trim()
-          : item.type === 'swap' && item.toAssetId
-            ? `${formatAmount(item.amount)} ${token.symbol} to ${formatAmount(item.receiveAmount || 0)} ${SWAP_TARGETS_BY_ID[item.toAssetId]?.symbol || ''}`.trim()
-            : `${formatAmount(item.amount)} ${token.symbol}`;
+    const token = TOKENS_BY_ID[item.tokenId];
+    const label = item.type === 'buy' ? 'Bought' : item.type === 'swap' ? 'Swapped' : 'Sent';
+    const meta = item.type === 'send' && item.to ? `${formatAmount(item.amount)} ${token.symbol} to ${item.to.slice(0, 6)}...${item.to.slice(-4)}` : `${formatAmount(item.amount)} ${token.symbol}`;
     return `
       <article class="activity-item">
         <div class="activity-main">
@@ -607,6 +586,8 @@ function renderAccounts() {
       </div>
       <div class="market-price">${formatUsd(
         account.holdings.reduce((sum, holding) => sum + holding.amount * (state.prices[holding.tokenId]?.usd || 0), 0)
+        + (account.fiatBalances?.usd || 0)
+        + ((account.fiatBalances?.aud || 0) / getAudPerUsd())
       )}</div>
     </button>
   `).join('');
@@ -692,7 +673,7 @@ function renderBuyPicker() {
 
 function getSwapOwnedAssets() {
   const current = getCurrentAccount();
-  return current.holdings
+  const tokenAssets = current.holdings
     .filter((holding) => holding.amount > 0)
     .map((holding) => ({
       id: holding.tokenId,
@@ -702,6 +683,16 @@ function getSwapOwnedAssets() {
       type: 'token',
       amount: holding.amount,
     }));
+
+  const fiatAssets = [];
+  if (getFiatBalance('usd') > 0) {
+    fiatAssets.push({ id: 'fiat-usd', symbol: 'USD', name: 'US Dollar', logoUrl: '', type: 'fiat', amount: getFiatBalance('usd') });
+  }
+  if (getFiatBalance('aud') > 0) {
+    fiatAssets.push({ id: 'fiat-aud', symbol: 'AUD', name: 'Australian Dollar', logoUrl: '', type: 'fiat', amount: getFiatBalance('aud') });
+  }
+
+  return [...tokenAssets, ...fiatAssets];
 }
 
 function getFilteredSwapTargets() {
@@ -831,7 +822,7 @@ function updateBuyQuote() {
     dom.buyQuote.textContent = `${formatUsd(tokenPrice.usd || 0)} / ${TOKENS_BY_ID[tokenId].symbol}`;
   }
 
-  const amountValue = parseAmountInput(dom.buyAmountInput.value);
+  const amountValue = Number(dom.buyAmountInput.value);
   if (!Number.isFinite(amountValue) || amountValue <= 0) {
     dom.buyReceive.textContent = `~0 ${token.symbol}`;
     return;
@@ -887,7 +878,7 @@ function updateSwapQuote() {
       : getHoldingAmount(fromId);
   dom.swapAvailable.textContent = `Available ${formatAmount(available)} ${fromAsset.symbol}`;
 
-  const amount = parseAmountInput(dom.swapAmountInput.value);
+  const amount = Number(dom.swapAmountInput.value);
   if (!Number.isFinite(amount) || amount <= 0) {
     dom.swapReceiveLabel.textContent = `~0 ${toAsset.symbol}`;
     return;
@@ -974,7 +965,7 @@ function updateSendAvailability() {
   }
   const symbol = TOKENS_BY_ID[tokenId].symbol;
   dom.sendAvailable.textContent = `Available ${formatAmount(getHoldingAmount(tokenId))} ${symbol}`;
-  const amount = parseAmountInput(dom.sendAmountInput.value);
+  const amount = Number(dom.sendAmountInput.value);
   dom.sendPreviewLabel.textContent = Number.isFinite(amount) && amount > 0 ? `Sending ~${formatAmount(amount)} ${symbol}` : 'Ready to send';
 }
 
@@ -1205,7 +1196,7 @@ function handleFlowBack() {
 async function onBuySubmit(event) {
   event.preventDefault();
   const tokenId = state.selectedBuyTokenId;
-  const amountInput = parseAmountInput(dom.buyAmountInput.value);
+  const amountInput = Number(dom.buyAmountInput.value);
   const unit = state.buyUnit || 'usd';
   const tokenPrice = state.prices[tokenId];
 
@@ -1251,7 +1242,7 @@ async function onSwapSubmit(event) {
   event.preventDefault();
   const fromId = state.selectedSwapFromId;
   const toId = state.selectedSwapToId;
-  const amount = parseAmountInput(dom.swapAmountInput.value);
+  const amount = Number(dom.swapAmountInput.value);
   if (!fromId || !toId) {
     showToast('Choose both swap assets.');
     return;
@@ -1287,34 +1278,36 @@ async function onSwapSubmit(event) {
 
   const receiveAmount = (amount * fromUsd) / toUsd;
 
-  const isSellToFiat = toId === 'fiat-usd' || toId === 'fiat-aud';
-
-  await withFakeLoading(isSellToFiat ? 'Executing sale...' : 'Executing swap...', async () => {
-    updateHolding(fromId, -amount);
-
-    if (isSellToFiat) {
-      pushActivity('sell', fromId, amount, { settlementAssetId: toId, settlementAmount: receiveAmount });
+  await withFakeLoading('Executing swap...', async () => {
+    if (fromId === 'fiat-usd') {
+      updateFiatBalance('usd', -amount);
+    } else if (fromId === 'fiat-aud') {
+      updateFiatBalance('aud', -amount);
     } else {
-      updateHolding(toId, receiveAmount);
-      pushActivity('swap', fromId, amount, { toAssetId: toId, receiveAmount });
+      updateHolding(fromId, -amount);
     }
 
+    if (toId === 'fiat-usd') {
+      updateFiatBalance('usd', receiveAmount);
+    } else if (toId === 'fiat-aud') {
+      updateFiatBalance('aud', receiveAmount);
+    } else {
+      updateHolding(toId, receiveAmount);
+    }
+
+    pushActivity('swap', fromId, amount, { toAssetId: toId, receiveAmount });
     dom.swapAmountInput.value = '';
     await saveState();
     render();
   });
-  showToast(
-    isSellToFiat
-      ? `${formatAmount(amount)} ${SWAP_TARGETS_BY_ID[fromId].symbol} sold for ${formatAmount(receiveAmount)} ${SWAP_TARGETS_BY_ID[toId].symbol}.`
-      : `${formatAmount(amount)} ${SWAP_TARGETS_BY_ID[fromId].symbol} swapped to ${formatAmount(receiveAmount)} ${SWAP_TARGETS_BY_ID[toId].symbol}.`
-  );
+  showToast(`${formatAmount(amount)} ${SWAP_TARGETS_BY_ID[fromId].symbol} swapped to ${formatAmount(receiveAmount)} ${SWAP_TARGETS_BY_ID[toId].symbol}.`);
 }
 
 async function onSendSubmit(event) {
   event.preventDefault();
   const tokenId = state.selectedSendTokenId;
   const address = dom.sendAddressInput.value.trim();
-  const amount = parseAmountInput(dom.sendAmountInput.value);
+  const amount = Number(dom.sendAmountInput.value);
   const available = getHoldingAmount(tokenId);
   if (!address) {
     showToast('Enter a wallet address.');
@@ -1333,40 +1326,15 @@ async function onSendSubmit(event) {
     return;
   }
 
-  const currentAccount = getCurrentAccount();
-  const targetAccount = getAccountByAddress(address);
-  if (targetAccount && targetAccount.id === currentAccount.id) {
-    showToast('Choose a different account address.');
-    return;
-  }
-
-  await withFakeLoading(targetAccount ? 'Transferring asset...' : 'Sending asset...', async () => {
+  await withFakeLoading('Sending asset...', async () => {
     updateHolding(tokenId, -amount);
-    pushActivity('send', tokenId, amount, {
-      to: address,
-      toName: targetAccount?.name || null
-    });
-
-    if (targetAccount) {
-      targetAccount.holdings = targetAccount.holdings
-        .filter((holding) => holding.tokenId !== tokenId)
-        .concat([{ tokenId, amount: (targetAccount.holdings.find((holding) => holding.tokenId === tokenId)?.amount || 0) + amount }]);
-      pushActivityToAccount(targetAccount, 'receive', tokenId, amount, {
-        from: currentAccount.address,
-        fromName: currentAccount.name
-      });
-    }
-
+    pushActivity('send', tokenId, amount, { to: address });
     dom.sendAddressInput.value = '';
     dom.sendAmountInput.value = '';
     await saveState();
     render();
   });
-  showToast(
-    targetAccount
-      ? `${formatAmount(amount)} ${TOKENS_BY_ID[tokenId].symbol} transferred to ${targetAccount.name}.`
-      : `${formatAmount(amount)} ${TOKENS_BY_ID[tokenId].symbol} sent.`
-  );
+  showToast(`${formatAmount(amount)} ${TOKENS_BY_ID[tokenId].symbol} sent.`);
 }
 
 async function copyAddress() {
@@ -1466,34 +1434,38 @@ dom.buyUnitPills.addEventListener('click', (event) => {
   updateBuyQuote();
 });
 dom.buyAmountInput.addEventListener('input', () => {
-  dom.buyAmountInput.value = formatAmountInput(dom.buyAmountInput.value);
+  dom.buyAmountInput.value = sanitizeDecimal(dom.buyAmountInput.value);
   updateBuyQuote();
 });
 dom.buyMaxButton.addEventListener('click', () => {
   const max = getBuyMaxAmount();
-  dom.buyAmountInput.value = max > 0 ? formatAmountInput(Number(max.toFixed(6))) : '';
+  dom.buyAmountInput.value = max > 0 ? String(Number(max.toFixed(6))) : '';
   updateBuyQuote();
 });
 dom.swapAmountInput.addEventListener('input', () => {
-  dom.swapAmountInput.value = formatAmountInput(dom.swapAmountInput.value);
+  dom.swapAmountInput.value = sanitizeDecimal(dom.swapAmountInput.value);
   updateSwapQuote();
 });
 dom.swapMaxButton.addEventListener('click', () => {
   const fromId = state.selectedSwapFromId;
   if (!fromId) return;
-  const available = getHoldingAmount(fromId);
-  dom.swapAmountInput.value = available > 0 ? formatAmountInput(Number(available.toFixed(6))) : '';
+  const available = fromId === 'fiat-usd'
+    ? getFiatBalance('usd')
+    : fromId === 'fiat-aud'
+      ? getFiatBalance('aud')
+      : getHoldingAmount(fromId);
+  dom.swapAmountInput.value = available > 0 ? String(Number(available.toFixed(6))) : '';
   updateSwapQuote();
 });
 dom.sendAmountInput.addEventListener('input', () => {
-  dom.sendAmountInput.value = formatAmountInput(dom.sendAmountInput.value);
+  dom.sendAmountInput.value = sanitizeDecimal(dom.sendAmountInput.value);
   updateSendAvailability();
 });
 dom.sendMaxButton.addEventListener('click', () => {
   const tokenId = state.selectedSendTokenId;
   if (!tokenId) return;
   const available = getHoldingAmount(tokenId);
-  dom.sendAmountInput.value = available > 0 ? formatAmountInput(Number(available.toFixed(6))) : '';
+  dom.sendAmountInput.value = available > 0 ? String(Number(available.toFixed(6))) : '';
   updateSendAvailability();
 });
 dom.receiveAddressButton.addEventListener('click', copyAddress);
